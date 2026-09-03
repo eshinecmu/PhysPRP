@@ -1,0 +1,33 @@
+{
+  "scene_dir": "data/torus",
+  "view_id": 0,
+  "frame_id": 0,
+  "object_name": "object_000",
+  "work_dir": "outputs/torus",
+  "commands": {
+    "rest3d_scene_tree": {
+      "cwd": "model/reconstruction/rest3d",
+      "argv": ["python", "scripts/infer_scenetree.py", "--image_folder", "{rgb}", "--output_folder", "{rest3d_output}"]
+    },
+    "rest3d_reconstruction": {
+      "cwd": "model/reconstruction/rest3d",
+      "argv": ["python", "scripts/infer_scene3d.py", "--image_folder", "{rgb}", "--output_folder", "{rest3d_output}"]
+    },
+    "rest3d_multiview": {
+      "cwd": "model/material/pixie",
+      "argv": ["python", "pipeline.py", "obj_id={sample_name}", "obj_path={rest3d_obj}", "pipeline_stage=render", "paths.base_path={work_dir}/pixie", "run_physics_simulation=false"]
+    },
+    "pixie_material": {
+      "cwd": "model/material/pixie",
+      "argv": ["python", "pipeline.py", "obj_id={sample_name}", "obj_path={rest3d_obj}", "pipeline_stage=material", "material_mode=neural", "paths.base_path={work_dir}/pixie", "material_output_path={material_output}", "run_physics_simulation=false"]
+    },
+    "pac_nerf_train": {
+      "cwd": "model/dynamics/pac_nerf",
+      "argv": ["python", "train.py", "--config", "configs/torus.py", "--data-dir", "{scene_dir}", "--base-dir", "{pac_output}", "--material-field", "{material_output}"]
+    },
+    "pac_nerf_render": {
+      "cwd": "model/dynamics/pac_nerf",
+      "argv": ["python", "test.py", "--config", "configs/torus.py", "--num-frame", "14", "--cam-id", "0", "--data-dir", "{scene_dir}", "--base-dir", "{pac_output}", "--material-field", "{material_output}"]
+    }
+  }
+}
