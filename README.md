@@ -64,8 +64,9 @@ Begin by reconstructing a 3D GS scene as per [Gaussian Splatting](https://github
 ### REST3D → PhysGaussian minimal path
 
 REST3D and PhysGaussian use different representations. Run REST3D first and
-keep its raw OBJ, canonical OBJ, and the SAM3D Gaussian PLY. The patched
-`REST3D/scripts/infer_scene3d.py` writes the latter beside each raw OBJ; it is
+keep its raw OBJ, canonical OBJ, and the SAM3D Gaussian PLY. PhysPRP vendors
+the required REST3D source under `third_party/REST3D`; its patched
+`third_party/REST3D/scripts/infer_scene3d.py` writes the latter beside each raw OBJ; it is
 not a PhysGaussian checkpoint yet.
 
 For one object resting on the floor, adapt the two OBJ frames and copy the
