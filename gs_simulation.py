@@ -52,7 +52,24 @@ class PipelineParamsNoparse:
         self.debug = False
 
 
-def load_checkpoint(model_path, sh_degree=3, iteration=-1):
+def infer_sh_degree(checkpoint_path):
+    """Infer the SH degree from the PLY instead of assuming degree 3."""
+    rest_count = 0
+    with open(checkpoint_path, "rb") as handle:
+        for line in handle:
+            if line == b"end_header\n":
+                break
+            if line.startswith(b"property ") and b"f_rest_" in line:
+                rest_count += 1
+    if rest_count == 0:
+        return 0
+    channels, remainder = divmod(rest_count, 3)
+    if remainder or channels not in (3, 8, 15):
+        raise ValueError(f"Unsupported SH field count ({rest_count}) in {checkpoint_path}")
+    return int((channels + 1) ** 0.5 - 1)
+
+
+def load_checkpoint(model_path, sh_degree=None, iteration=-1):
     # Find checkpoint
     checkpt_dir = os.path.join(model_path, "point_cloud")
     if iteration == -1:
@@ -60,6 +77,9 @@ def load_checkpoint(model_path, sh_degree=3, iteration=-1):
     checkpt_path = os.path.join(
         checkpt_dir, f"iteration_{iteration}", "point_cloud.ply"
     )
+
+    if sh_degree is None:
+        sh_degree = infer_sh_degree(checkpt_path)
 
     # Load guassians
     gaussians = GaussianModel(sh_degree)

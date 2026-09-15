@@ -61,6 +61,62 @@ To generate custom dynamics, follow these guidelines:
 ### Gaussian Splatting Reconstruction
 Begin by reconstructing a 3D GS scene as per [Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting).
 
+### REST3D → PhysGaussian minimal path
+
+REST3D and PhysGaussian use different representations. Run REST3D first and
+keep its raw OBJ, canonical OBJ, and the SAM3D Gaussian PLY. The patched
+`REST3D/scripts/infer_scene3d.py` writes the latter beside each raw OBJ; it is
+not a PhysGaussian checkpoint yet.
+
+For one object resting on the floor, adapt the two OBJ frames and copy the
+Gaussian fields into the directory layout expected by PhysGaussian:
+
+```shell
+python tools/prepare_rest3d_object.py \
+  --raw-obj <rest3d>/scene_raw/obj_files/<object>.obj \
+  --canonical-obj <rest3d>/scene_canon/obj_files/scene_canon_<object>.obj \
+  --raw-gaussian <rest3d>/scene_raw/obj_files/<object>.ply \
+  --model-path <work>/rest3d_object
+python tools/validate_rest3d_object.py \
+  --model-path <work>/rest3d_object \
+  --canonical-obj <rest3d>/scene_canon/obj_files/scene_canon_<object>.obj
+python gs_simulation.py --model_path <work>/rest3d_object \
+  --output_path <work>/physgaussian_static \
+  --config config/rest3d_soft_object_jelly.json --output_ply --output_h5
+```
+
+Repeat with `config/rest3d_soft_object_jelly_perturb.json` for the small known
+impulse. Compare the saved `simulation_ply`/H5 frames against the initial
+state; this is a solver smoke test, not a measurement of the object's true
+material properties.
+
+The adapter uses the exact raw-OBJ → canonical-OBJ rigid transform for Gaussian
+centers and rotations and records it in `rest3d_alignment.json`. The config is
+a fixed illustrative jelly prior, not measured material data. `--output_ply`
+and `--output_h5` preserve per-frame particle state for static and perturbation
+trials. Add a `particle_impulse` boundary only for the second known-force
+trial. Internal filling is intentionally off in the first pass; enable it only
+after validating volume membership and positive particle volume.
+
+### LLM/VLM material prior
+
+PhysGaussian already owns the material model and parameter injection. Feed a
+structured LLM/VLM result through the small validator instead of letting a
+model write arbitrary solver code:
+
+```shell
+python tools/apply_material_prior.py \
+  --prior config/material_prior.example.json \
+  --template config/rest3d_soft_object_jelly.json \
+  --output <work>/rest3d_object/material_config.json
+python gs_simulation.py --model_path <work>/rest3d_object \
+  --output_path <work>/physgaussian_llm_prior \
+  --config <work>/rest3d_object/material_config.json --output_ply --output_h5
+```
+
+The saved config preserves the original prior, ranges, confidence, evidence,
+and `is_measured` flag. The values are priors unless independently measured.
+
 ### Data Preprocessing
 Before simulating Gaussian kernels as continuum particles, perform the following preprocessing steps:
 1. Remove Gaussian kernels with low opacity.
