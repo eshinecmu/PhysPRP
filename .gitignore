@@ -7,3 +7,10 @@ output
 *.jpg
 model
 log
+**/.venv
+**/envs
+**/checkpoints
+**/outputs
+**/vendor_zhuzhihan
+**/REST3D_API_KEYS.env
+**/__pycache__

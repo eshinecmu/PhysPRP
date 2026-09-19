@@ -1,12 +1,19 @@
 import sys
+import os
+import types
 
-sys.path.append("gaussian-splatting")
+_gs_root = os.path.abspath("gaussian-splatting")
+sys.path.insert(0, _gs_root)
+# The runtime checkout has a namespace-style ``utils`` directory while some
+# environments ship an unrelated regular ``utils`` package. Pin imports to GS.
+_gs_utils = types.ModuleType("utils")
+_gs_utils.__path__ = [_gs_root + "/utils", os.path.join(os.path.dirname(__file__), "utils")]
+sys.modules["utils"] = _gs_utils
 
 import argparse
 import math
 import cv2
 import torch
-import os
 import numpy as np
 import json
 from tqdm import tqdm
@@ -27,6 +34,7 @@ from utils.graphics_utils import focal2fov
 from mpm_solver_warp.engine_utils import *
 from mpm_solver_warp.mpm_solver_warp import MPM_Simulator_WARP
 import warp as wp
+from relation_mpm import RELATION_TYPES, RelationMPM
 
 # Particle filling dependencies
 from particle_filling.filling import *
@@ -52,24 +60,7 @@ class PipelineParamsNoparse:
         self.debug = False
 
 
-def infer_sh_degree(checkpoint_path):
-    """Infer the SH degree from the PLY instead of assuming degree 3."""
-    rest_count = 0
-    with open(checkpoint_path, "rb") as handle:
-        for line in handle:
-            if line == b"end_header\n":
-                break
-            if line.startswith(b"property ") and b"f_rest_" in line:
-                rest_count += 1
-    if rest_count == 0:
-        return 0
-    channels, remainder = divmod(rest_count, 3)
-    if remainder or channels not in (3, 8, 15):
-        raise ValueError(f"Unsupported SH field count ({rest_count}) in {checkpoint_path}")
-    return int((channels + 1) ** 0.5 - 1)
-
-
-def load_checkpoint(model_path, sh_degree=None, iteration=-1):
+def load_checkpoint(model_path, sh_degree=3, iteration=-1):
     # Find checkpoint
     checkpt_dir = os.path.join(model_path, "point_cloud")
     if iteration == -1:
@@ -78,13 +69,27 @@ def load_checkpoint(model_path, sh_degree=None, iteration=-1):
         checkpt_dir, f"iteration_{iteration}", "point_cloud.ply"
     )
 
-    if sh_degree is None:
-        sh_degree = infer_sh_degree(checkpt_path)
-
     # Load guassians
     gaussians = GaussianModel(sh_degree)
     gaussians.load_ply(checkpt_path)
     return gaussians
+
+
+def load_object_relations(path):
+    """Load the object-id relation manifest produced by the REST3D bridge."""
+    if not path:
+        return {}
+    payload = json.load(open(path, encoding="utf-8"))
+    edges = payload.get("edges", []) if isinstance(payload, dict) else payload
+    relations = {}
+    for edge in edges:
+        source = edge.get("source", edge.get("child_id"))
+        target = edge.get("target", edge.get("parent_id"))
+        if source is None or target is None:
+            continue
+        relation = str(edge.get("relation", "other")).lower()
+        relations[tuple(sorted((int(source), int(target))))] = RELATION_TYPES.get(relation, RELATION_TYPES["other"])
+    return relations
 
 
 if __name__ == "__main__":
@@ -98,6 +103,12 @@ if __name__ == "__main__":
     parser.add_argument("--compile_video", action="store_true")
     parser.add_argument("--white_bg", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--enable_relation", action="store_true")
+    parser.add_argument("--object_id_path", type=str, default=None)
+    parser.add_argument("--property_path", type=str, default=None)
+    parser.add_argument("--scene_relation_path", type=str, default=None)
+    parser.add_argument("--relation_checkpoint", type=str, default=None)
+    parser.add_argument("--relation_full_checkpoint", type=str, default=None)
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -138,6 +149,7 @@ if __name__ == "__main__":
     init_screen_points = params["screen_points"]
     init_opacity = params["opacity"]
     init_shs = params["shs"]
+    source_particle_indices = torch.arange(init_pos.shape[0], device=init_pos.device)
 
     # throw away low opacity kernels
     mask = init_opacity[:, 0] > preprocessing_params["opacity_threshold"]
@@ -146,6 +158,7 @@ if __name__ == "__main__":
     init_opacity = init_opacity[mask, :]
     init_screen_points = init_screen_points[mask, :]
     init_shs = init_shs[mask, :]
+    source_particle_indices = source_particle_indices[mask]
 
     # rorate and translate object
     if args.debug:
@@ -188,6 +201,7 @@ if __name__ == "__main__":
         init_cov = init_cov[mask, :]
         init_opacity = init_opacity[mask, :]
         init_shs = init_shs[mask, :]
+        source_particle_indices = source_particle_indices[mask]
 
     transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, preprocessing_params["scale"])
     transformed_pos = shift2center111(transformed_pos)
@@ -204,6 +218,7 @@ if __name__ == "__main__":
 
     # fill particles if needed
     gs_num = transformed_pos.shape[0]
+    surface_particle_count = gs_num
     device = "cuda:0"
     filling_params = preprocessing_params["particle_filling"]
 
@@ -254,6 +269,8 @@ if __name__ == "__main__":
         shs = init_shs
         opacity = init_opacity
 
+    render_particle_indices = torch.arange(gs_num, device=device)
+
     if args.debug:
         print("check *.ply files to see if it's ready for simulation")
 
@@ -267,11 +284,74 @@ if __name__ == "__main__":
         grid_lim=material_params["grid_lim"],
     )
     mpm_solver.set_parameters_dict(material_params)
+    particle_object_id = None
+    particle_material_id = None
+    if args.object_id_path:
+        particle_object_id = torch.from_numpy(np.load(args.object_id_path)).to(device=device, dtype=torch.long).reshape(-1)
+        if particle_object_id.numel() != surface_particle_count and source_particle_indices.numel() == surface_particle_count:
+            if source_particle_indices.numel() and int(source_particle_indices.max()) >= particle_object_id.numel():
+                raise ValueError("object_id labels do not cover the source Gaussian indices")
+            particle_object_id = particle_object_id[source_particle_indices]
+        if particle_object_id.numel() == surface_particle_count and mpm_init_pos.shape[0] > surface_particle_count:
+            filled_labels = []
+            surface_pos = mpm_init_pos[:surface_particle_count]
+            for start in range(surface_particle_count, mpm_init_pos.shape[0], 8192):
+                filled = mpm_init_pos[start:start + 8192]
+                nearest = torch.cdist(filled, surface_pos).argmin(1)
+                filled_labels.append(particle_object_id[nearest])
+            particle_object_id = torch.cat((particle_object_id, *filled_labels))
+        if particle_object_id.numel() != mpm_init_pos.shape[0]:
+            raise ValueError(f"object_id count mismatch: {particle_object_id.numel()} labels for {mpm_init_pos.shape[0]} particles")
+    if args.property_path:
+        if particle_object_id is None:
+            raise ValueError("--property_path requires --object_id_path")
+        records = {int(r["object_id"]): r for r in json.load(open(args.property_path))}
+        E = torch.full((mpm_init_pos.shape[0],), float(material_params["E"]), device=device)
+        nu = torch.full_like(E, float(material_params["nu"]))
+        density = torch.full_like(E, float(material_params["density"]))
+        material_names = sorted({str(record.get("material", "unknown")) for record in records.values()})
+        material_lookup = {name: idx for idx, name in enumerate(material_names)}
+        particle_material_id = torch.zeros_like(particle_object_id)
+        for oid in torch.unique(particle_object_id).tolist():
+            r = records[int(oid)]; mask = particle_object_id == oid
+            E[mask] = min(max(float(r["E"]), 1e4), 1e7)
+            nu[mask] = min(max(float(r["nu"]), .05), .45)
+            density[mask] = min(max(float(r["density"]), 50.), 3000.)
+            particle_material_id[mask] = material_lookup[str(r.get("material", "unknown"))]
+        mpm_solver.reset_material_fields(E, nu, density, device=device)
+    elif particle_object_id is not None:
+        particle_material_id = torch.zeros_like(particle_object_id)
 
     # Note: boundary conditions may depend on mass, so the order cannot be changed!
     set_boundary_conditions(mpm_solver, bc_params, time_params)
 
     mpm_solver.finalize_mu_lam()
+
+    if args.enable_relation:
+        object_relations = load_object_relations(args.scene_relation_path)
+        # Ficus is a single-object checkpoint; real multi-object runs must
+        # provide persistent per-particle object/material labels here.
+        relation = RelationMPM(
+            n_materials=max(16, int(particle_material_id.max().item()) + 1 if particle_material_id is not None else 1),
+            local_radius=1.75 * material_params["grid_lim"] / material_params["n_grid"],
+            contact_radius=1.75 * material_params["grid_lim"] / material_params["n_grid"],
+        ).to(device)
+        if args.relation_full_checkpoint:
+            full = torch.load(args.relation_full_checkpoint, map_location=device)["model"]
+            current = relation.state_dict()
+            usable = {k:v for k,v in full.items() if k in current and current[k].shape == v.shape}
+            relation.load_state_dict(usable, strict=False)
+            print("loaded full relation Transformer", args.relation_full_checkpoint, "tensors", len(usable))
+        if args.relation_checkpoint:
+            raise ValueError("Legacy acceleration LoRA checkpoints are incompatible with cached relation parameters; retrain the relation model")
+        if os.getenv("RELATION_ANALYTIC_PRIOR") == "1":
+            with torch.no_grad():
+                relation.force_output.bias[:] = torch.tensor([0.01, 0.01, 0.005, 0.0], device=device)
+        object_id = particle_object_id if particle_object_id is not None else torch.zeros(mpm_init_pos.shape[0], dtype=torch.long, device=device)
+        material_id = particle_material_id if particle_material_id is not None else torch.zeros_like(object_id)
+        mpm_solver.relation_step = lambda solver, dt: relation.step_solver(
+            solver, object_id, material_id, dt, object_relations
+        )
 
     # camera setting
     mpm_space_viewpoint_center = (
@@ -348,11 +428,11 @@ if __name__ == "__main__":
             )
 
         if args.render_img:
-            pos = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
+            pos = mpm_solver.export_particle_x_to_torch().index_select(0, render_particle_indices).to(device)
             cov3D = mpm_solver.export_particle_cov_to_torch()
             rot = mpm_solver.export_particle_R_to_torch()
-            cov3D = cov3D.view(-1, 6)[:gs_num].to(device)
-            rot = rot.view(-1, 3, 3)[:gs_num].to(device)
+            cov3D = cov3D.view(-1, 6).index_select(0, render_particle_indices).to(device)
+            rot = rot.view(-1, 3, 3).index_select(0, render_particle_indices).to(device)
 
             pos = apply_inverse_rotations(
                 undotransform2origin(

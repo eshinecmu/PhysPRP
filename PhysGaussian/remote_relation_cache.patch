@@ -1,0 +1,41 @@
+*** Begin Patch
+*** Update File: relation_mpm.py
+@@
+         nn.init.zeros_(self.force_output.weight)
+         nn.init.zeros_(self.force_output.bias)
++        # Evaluate the relation prior once per rollout; later MPM substeps
++        # reuse it without rebuilding edges or recomputing Q/K/V.
++        self._cached_acceleration = None
++        self._cached_signature = None
++
++    def reset_cache(self):
++        self._cached_acceleration = None
++        self._cached_signature = None
+@@
+     def step_solver(self, solver, object_id, material_id, dt):
+-        """Apply a detached relation step before the solver's particle BC and P2G."""
++        """Apply a one-time relation prior before particle BC and P2G."""
+@@
+-        with torch.no_grad():
+-            delta_v = self(x, v, object_id, material_id, mass, dt, E, nu, density)
+-            if hasattr(state, "particle_selection"):
+-                active = wp.to_torch(state.particle_selection).reshape(-1) == 0
+-                delta_v = delta_v * active.unsqueeze(1)
+-            updated_v = (v + delta_v).to(torch.float32).contiguous()
+-            solver.import_particle_v_from_torch(updated_v, clone=False, device=str(x.device))
++        signature = (int(n), float(dt), int(object_id.sum().item()), int(material_id.sum().item()))
++        with torch.no_grad():
++            if self._cached_acceleration is None or self._cached_signature != signature:
++                if torch.unique(object_id).numel() == 1 and torch.unique(material_id).numel() == 1:
++                    acceleration = torch.zeros_like(v)
++                else:
++                    delta_v = self(x, v, object_id, material_id, mass, dt, E, nu, density)
++                    acceleration = delta_v / max(float(dt), 1e-12)
++                if hasattr(state, "particle_selection"):
++                    active = wp.to_torch(state.particle_selection).reshape(-1) == 0
++                    acceleration = acceleration * active.unsqueeze(1)
++                self._cached_acceleration = acceleration.detach().to(torch.float32).contiguous()
++                self._cached_signature = signature
++            delta_v = self._cached_acceleration * float(dt)
++            updated_v = (v + delta_v).to(torch.float32).contiguous()
++            solver.import_particle_v_from_torch(updated_v, clone=False, device=str(x.device))
