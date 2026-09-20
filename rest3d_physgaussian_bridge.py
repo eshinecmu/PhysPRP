@@ -21,10 +21,22 @@ def main():
     if not meshes:
         raise FileNotFoundError(f"No REST3D OBJ meshes in {mesh_dir}")
 
+    tree_objects = {
+        str(obj.get("name", ""))
+        for obj in tree.get("objects", [])
+        if obj.get("name")
+    }
+
     rows = []
     name_to_id = {}
     for object_id, mesh in enumerate(meshes):
         name = mesh.stem.removeprefix("scene_canon_")
+        if not name:
+            raise ValueError(f"Could not derive an object name from {mesh}")
+        if name in name_to_id:
+            raise ValueError(f"Duplicate REST3D object name: {name}")
+        if tree_objects and name not in tree_objects:
+            raise ValueError(f"Mesh {name!r} is missing from the REST3D scene tree")
         name_to_id[name] = object_id
         rows.append({"path": str(mesh.resolve()), "object_id": object_id, "name": name})
 

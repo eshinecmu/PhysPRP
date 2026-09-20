@@ -41,7 +41,7 @@ We provide several pretrained [Gaussian Splatting models](https://drive.google.c
 
 To simulate a reconstructed 3D Gaussian Splatting scene, run the following command:
 ```shell
-python gs_simulation.py --model_path <path to gs model> --output_path <path to output folder> --config <path to json config file> --render_img --compile_video
+python PhysGaussian/gs_simulation.py --model_path <path to gs model> --output_path <path to output folder> --config <path to json config file> --render_img --compile_video
 ```
 The images and video results will be saved to the specified output_path.
 
@@ -49,7 +49,7 @@ If you want a quick try, run:
 ```shell
 pip install gdown
 bash download_sample_model.sh
-python gs_simulation.py --model_path ./model/ficus_whitebg-trained/ --output_path output --config ./config/ficus_config.json --render_img --compile_video --white_bg
+python PhysGaussian/gs_simulation.py --model_path ./model/ficus_whitebg-trained/ --output_path output --config ./config/ficus_config.json --render_img --compile_video --white_bg
 ```
 Hopefully, you will see a video result like this:
 
@@ -61,7 +61,7 @@ To generate custom dynamics, follow these guidelines:
 ### Gaussian Splatting Reconstruction
 Begin by reconstructing a 3D GS scene as per [Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting).
 
-### REST3D â†’ PhysGaussian minimal path
+### REST3D â†?PhysGaussian minimal path
 
 REST3D and PhysGaussian use different representations. Run REST3D first and
 keep its raw OBJ, canonical OBJ, and the SAM3D Gaussian PLY. PhysPRP vendors
@@ -81,7 +81,7 @@ python tools/prepare_rest3d_object.py \
 python tools/validate_rest3d_object.py \
   --model-path <work>/rest3d_object \
   --canonical-obj <rest3d>/scene_canon/obj_files/scene_canon_<object>.obj
-python gs_simulation.py --model_path <work>/rest3d_object \
+python PhysGaussian/gs_simulation.py --model_path <work>/rest3d_object \
   --output_path <work>/physgaussian_static \
   --config config/rest3d_soft_object_jelly.json --output_ply --output_h5
 ```
@@ -91,7 +91,7 @@ impulse. Compare the saved `simulation_ply`/H5 frames against the initial
 state; this is a solver smoke test, not a measurement of the object's true
 material properties.
 
-The adapter uses the exact raw-OBJ â†’ canonical-OBJ rigid transform for Gaussian
+The adapter uses the exact raw-OBJ â†?canonical-OBJ rigid transform for Gaussian
 centers and rotations and records it in `rest3d_alignment.json`. The config is
 a fixed illustrative jelly prior, not measured material data. `--output_ply`
 and `--output_h5` preserve per-frame particle state for static and perturbation
@@ -110,7 +110,7 @@ python tools/apply_material_prior.py \
   --prior config/material_prior.example.json \
   --template config/rest3d_soft_object_jelly.json \
   --output <work>/rest3d_object/material_config.json
-python gs_simulation.py --model_path <work>/rest3d_object \
+python PhysGaussian/gs_simulation.py --model_path <work>/rest3d_object \
   --output_path <work>/physgaussian_llm_prior \
   --config <work>/rest3d_object/material_config.json --output_ply --output_h5
 ```
