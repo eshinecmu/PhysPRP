@@ -1,0 +1,40 @@
+# WorldParticle Transformer + independent GT single-step training.
+dataset:
+  train_trajectories:
+  - /mnt/workspace/public/data/PhysPRP_elastic_multivideo_20261021/data/episodes/uniphy_nclaw_jelly.pt
+  - /mnt/workspace/public/data/PhysPRP_elastic_multivideo_20261021/data/episodes/uniphy_demo_Elastic_Toy.pt
+  validation_trajectories:
+  - /mnt/workspace/public/data/PhysPRP_elastic_multivideo_20261021/data/episodes/pac_material_compression_20260922.pt
+  test_trajectories:
+  - /mnt/workspace/public/data/PhysPRP_elastic_multivideo_20261021/data/episodes/uniphy_demo_Elastic_Blobby.pt
+rollout:
+  clip_bound: 0.5
+  ground_surface: separate
+  ground_elasticity: 0.0
+  ground_friction: 0.0
+  use_explicit_rigid_contact: false
+  elasticity_model: CorotatedElasticity
+  plasticity_model: IdentityPlasticity
+train:
+  seed: 7
+  device: cuda:0
+  output_dir: outputs/worldparticle_single_step_20261021/training
+  epochs: 5
+  lr: 1.0e-05
+  final_lr: 1.0e-06
+  lr_decay_start: 2
+  lr_decay_end: 5
+  weight_decay: 0.0
+  grad_clip: 0.5
+  mode: single-step
+  batch_size: 50
+correction:
+  max_delta_v: 0.002
+  h: 1
+  bptt_frames: 1
+model:
+  kind: worldparticle
+  source_root: /mnt/workspace/eshine/PhysPRP/third_party/WorldParticle
+  width: 32
+  merge_iterations: 3
+  decoder_layers: 2

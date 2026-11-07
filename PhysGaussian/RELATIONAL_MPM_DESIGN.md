@@ -2,6 +2,12 @@
 
 ## 方法定义
 
+默认仿真训练入口现已采用官方 PhysCoRe 的 MfM/RfD 流程，直接复用其可微 MPM 与网格修正网络，在 G2P 前修正网格速度，通过位置重建损失反传并持续携带 x/v/F/C。已有真实物性的 jelly 使用明确标注的 known-material RfD 适配；完整 MfM/RfD 由官方入口处理对应数据。具体命令和兼容范围见 `INFERENCE.md`。
+
+本文件下文保留历史关系网络方案。`--pipeline post-step` 仍可显式运行此前的**仿真后速度残差**：每个样本从真实完整状态计算 `v_true_next-v_base`，`PostStepRelationMPM` 在 G2P 后施加 `v=v_base+delta_v`、`x=x_base+dt*delta_v`，而 C/F 保留 baseline。这也是现有 Gaussian 渲染入口的旧 checkpoint 约定，不能加载 PhysCoRe RfD 权重。
+
+下文的早期成对力/事件缓存设计保留为历史方案；它由旧 `RelationMPM` 实现，不是当前仿真后速度残差的监督或 checkpoint 约定。实际训练、推理接口以 `INFERENCE.md` 和 `train_relation_full.py` 为准。材料先验分支仍在初始化时设置物性，与速度校正分开。
+
 以 PhysGaussian 的 Warp MPM 为物理主干。所有参与仿真的表面 Gaussian 粒子和内部填充粒子组成完整集合 `P={p_i}_{i=1}^N`；关系 Transformer 在每个 MPM 子步的物理更新早期读取这个完整集合，并以材料内局部邻域、异材料界面和跨物体近接触关系调制粒子运动。MPM 随后完成应力、P2G、网格更新和 G2P；最后仅把具有渲染对应关系的粒子状态投影回 Gaussian。网络不读取仅供渲染的 `gs_num` 前缀作为其全部输入。
 
 ```mermaid

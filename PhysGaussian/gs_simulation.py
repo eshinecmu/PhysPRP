@@ -1,8 +1,12 @@
 import sys
 import os
 import types
+from pathlib import Path
+import subprocess
 
-_gs_root = os.path.abspath("gaussian-splatting")
+_gs_root = str(Path(os.environ.get("PHYS_GS_ROOT", Path(__file__).resolve().parents[1] / "gaussian-splatting")).resolve())
+if not (Path(_gs_root) / "scene" / "gaussian_model.py").is_file():
+    raise FileNotFoundError(f"Gaussian splatting source missing: {_gs_root}; set PHYS_GS_ROOT")
 sys.path.insert(0, _gs_root)
 # The runtime checkout has a namespace-style ``utils`` directory while some
 # environments ship an unrelated regular ``utils`` package. Pin imports to GS.
@@ -34,7 +38,8 @@ from utils.graphics_utils import focal2fov
 from mpm_solver_warp.engine_utils import *
 from mpm_solver_warp.mpm_solver_warp import MPM_Simulator_WARP
 import warp as wp
-from relation_mpm import RELATION_TYPES, RelationMPM
+from relation_mpm import RELATION_TYPES, PostStepRelationMPM, load_relation_checkpoint
+from gaussian_property_adapter import MATERIAL_VOCAB, particle_material_fields
 
 # Particle filling dependencies
 from particle_filling.filling import *
@@ -45,6 +50,7 @@ from utils.transformation_utils import *
 from utils.camera_view_utils import *
 from utils.render_utils import *
 
+wp.config.kernel_cache_dir = os.environ.get("WARP_CACHE_PATH", str(Path(__file__).resolve().parents[1] / ".cache" / "warp"))
 wp.init()
 wp.config.verify_cuda = True
 
@@ -95,7 +101,7 @@ def load_object_relations(path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, default=None)
+    parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output_ply", action="store_true")
     parser.add_argument("--output_h5", action="store_true")
@@ -104,6 +110,7 @@ if __name__ == "__main__":
     parser.add_argument("--white_bg", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--enable_relation", action="store_true")
+    parser.add_argument("--object_manifest", type=str)
     parser.add_argument("--object_id_path", type=str, default=None)
     parser.add_argument("--property_path", type=str, default=None)
     parser.add_argument("--scene_relation_path", type=str, default=None)
@@ -112,9 +119,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
-        AssertionError("Model path does not exist!")
+        raise FileNotFoundError("Model path does not exist!")
     if not os.path.exists(args.config):
-        AssertionError("Scene config does not exist!")
+        raise FileNotFoundError("Scene config does not exist!")
     if args.output_path is not None and not os.path.exists(args.output_path):
         os.makedirs(args.output_path)
 
@@ -127,6 +134,7 @@ if __name__ == "__main__":
         preprocessing_params,
         camera_params,
     ) = decode_param_json(args.config)
+    scene_config = json.loads(Path(args.config).read_text(encoding="utf-8"))
 
     # load gaussians
     print("Loading gaussians...")
@@ -150,6 +158,17 @@ if __name__ == "__main__":
     init_opacity = params["opacity"]
     init_shs = params["shs"]
     source_particle_indices = torch.arange(init_pos.shape[0], device=init_pos.device)
+    source_ids = None
+    object_records = None
+    if args.object_manifest:
+        if not args.object_id_path:
+            raise ValueError("Object manifest requires Gaussian object labels")
+        object_records = json.loads(Path(args.object_manifest).read_text())
+        source_ids = torch.as_tensor(np.load(args.object_id_path), device=init_pos.device, dtype=torch.long)
+        if source_ids.shape != (len(init_pos),):
+            raise ValueError("Source Gaussian object labels have wrong length")
+        if set(source_ids.tolist()) != {r["object_id"] for r in object_records}:
+            raise ValueError("Manifest and Gaussian identities differ")
 
     # throw away low opacity kernels
     mask = init_opacity[:, 0] > preprocessing_params["opacity_threshold"]
@@ -184,13 +203,28 @@ if __name__ == "__main__":
         None,
         None,
     )
-    if preprocessing_params["sim_area"] is not None:
+    has_background = False
+    if preprocessing_params["sim_area"] is not None or object_records is not None:
         boundary = preprocessing_params["sim_area"]
-        assert len(boundary) == 6
+        if boundary is not None and len(boundary) != 6:
+            raise ValueError("sim_area must have six bounds")
         mask = torch.ones(rotated_pos.shape[0], dtype=torch.bool).to(device="cuda")
-        for i in range(3):
-            mask = torch.logical_and(mask, rotated_pos[:, i] > boundary[2 * i])
-            mask = torch.logical_and(mask, rotated_pos[:, i] < boundary[2 * i + 1])
+        if boundary is not None:
+            for i in range(3):
+                mask &= (rotated_pos[:, i] > boundary[2*i]) & (rotated_pos[:, i] < boundary[2*i+1])
+        if object_records is not None:
+            dynamic = torch.zeros_like(mask)
+            for record in object_records:
+                if record["role"] == "dynamic":
+                    dynamic |= source_ids[source_particle_indices] == record["object_id"]
+                elif record["role"] in ("floor", "static"):
+                    settings = scene_config["objects"][record["name"]]
+                    if "collider" not in settings:
+                        raise ValueError(f"Explicit collider required for {record['name']}")
+            mask &= dynamic
+        if not mask.any():
+            raise ValueError("No dynamic Gaussians remain after role/area filtering")
+        has_background = bool((~mask).any())
 
         unselected_pos = init_pos[~mask, :]
         unselected_cov = init_cov[~mask, :]
@@ -203,8 +237,21 @@ if __name__ == "__main__":
         init_shs = init_shs[mask, :]
         source_particle_indices = source_particle_indices[mask]
 
-    transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, preprocessing_params["scale"])
-    transformed_pos = shift2center111(transformed_pos)
+    if object_records is not None:
+        if preprocessing_params["rotation_degree"] or "mpm_origin" not in scene_config:
+            raise ValueError("Native scene requires explicit mpm_origin and no implicit preprocessing rotation")
+        offset = torch.as_tensor(scene_config["mpm_origin"], device=rotated_pos.device, dtype=rotated_pos.dtype)
+        if offset.shape != (3,) or not torch.isfinite(offset).all():
+            raise ValueError("mpm_origin must be a finite translation in meters")
+        scale_origin = torch.tensor(1., device=rotated_pos.device)
+        original_mean_pos = 1. - offset
+        transformed_pos = rotated_pos + offset
+    else:
+        transformed_pos, scale_origin, original_mean_pos = transform2origin(rotated_pos, preprocessing_params["scale"])
+        transformed_pos = shift2center111(transformed_pos)
+    margin = material_params["grid_lim"] / material_params["n_grid"] * 3
+    if not torch.isfinite(transformed_pos).all() or (transformed_pos < margin).any() or (transformed_pos > material_params["grid_lim"] - margin).any():
+        raise ValueError("Dynamic scene outside MPM grid margin; adjust explicit mpm_origin/grid_lim")
 
     # modify covariance matrix accordingly
     init_cov = apply_cov_rotations(init_cov, rotation_matrices)
@@ -216,6 +263,11 @@ if __name__ == "__main__":
             "./log/transformed_particles.ply",
         )
 
+    if object_records is not None:
+        expected_dynamic = {r["object_id"] for r in object_records if r["role"] == "dynamic"}
+        retained_dynamic = set(source_ids[source_particle_indices].tolist())
+        if expected_dynamic != retained_dynamic:
+            raise ValueError(f"Dynamic objects removed by filtering: {expected_dynamic-retained_dynamic}")
     # fill particles if needed
     gs_num = transformed_pos.shape[0]
     surface_particle_count = gs_num
@@ -284,14 +336,14 @@ if __name__ == "__main__":
         grid_lim=material_params["grid_lim"],
     )
     mpm_solver.set_parameters_dict(material_params)
+    mpm_solver.enable_contact_diagnostics(True)
     particle_object_id = None
     particle_material_id = None
     if args.object_id_path:
         particle_object_id = torch.from_numpy(np.load(args.object_id_path)).to(device=device, dtype=torch.long).reshape(-1)
-        if particle_object_id.numel() != surface_particle_count and source_particle_indices.numel() == surface_particle_count:
-            if source_particle_indices.numel() and int(source_particle_indices.max()) >= particle_object_id.numel():
-                raise ValueError("object_id labels do not cover the source Gaussian indices")
-            particle_object_id = particle_object_id[source_particle_indices]
+        if source_particle_indices.numel() and int(source_particle_indices.max()) >= particle_object_id.numel():
+            raise ValueError("object_id labels do not cover source Gaussian indices")
+        particle_object_id = particle_object_id[source_particle_indices]
         if particle_object_id.numel() == surface_particle_count and mpm_init_pos.shape[0] > surface_particle_count:
             filled_labels = []
             surface_pos = mpm_init_pos[:surface_particle_count]
@@ -306,22 +358,38 @@ if __name__ == "__main__":
         if particle_object_id is None:
             raise ValueError("--property_path requires --object_id_path")
         records = {int(r["object_id"]): r for r in json.load(open(args.property_path))}
-        E = torch.full((mpm_init_pos.shape[0],), float(material_params["E"]), device=device)
-        nu = torch.full_like(E, float(material_params["nu"]))
-        density = torch.full_like(E, float(material_params["density"]))
-        material_names = sorted({str(record.get("material", "unknown")) for record in records.values()})
-        material_lookup = {name: idx for idx, name in enumerate(material_names)}
-        particle_material_id = torch.zeros_like(particle_object_id)
-        for oid in torch.unique(particle_object_id).tolist():
-            r = records[int(oid)]; mask = particle_object_id == oid
-            E[mask] = min(max(float(r["E"]), 1e4), 1e7)
-            nu[mask] = min(max(float(r["nu"]), .05), .45)
-            density[mask] = min(max(float(r["density"]), 50.), 3000.)
-            particle_material_id[mask] = material_lookup[str(r.get("material", "unknown"))]
-        mpm_solver.reset_material_fields(E, nu, density, device=device)
+        fields, material_audit = particle_material_fields(
+            records, particle_object_id
+        )
+
+        particle_material_id = fields["material_id"]
+
+        mpm_solver.reset_material_fields(
+            fields["E"], fields["nu"], fields["density"], device=device
+        )
+
+        for audit in material_audit:
+            audit["constitutive_model"] = material_params["material"]
+        Path(args.output_path, "material_actual.json").write_text(json.dumps(material_audit, indent=2))
     elif particle_object_id is not None:
         particle_material_id = torch.zeros_like(particle_object_id)
 
+    if object_records is not None:
+        velocity = torch.zeros_like(mpm_init_pos)
+        for record in object_records:
+            settings = scene_config.get("objects", {}).get(record["name"], {})
+            if record["role"] == "dynamic":
+                value = torch.as_tensor(settings.get("velocity", [0., 0., 0.]), device=device, dtype=velocity.dtype)
+                if value.shape != (3,) or not torch.isfinite(value).all():
+                    raise ValueError("Initial velocity must be finite meters/second")
+                velocity[particle_object_id == record["object_id"]] = value
+            elif record["role"] in ("floor", "static"):
+                collider = dict(settings["collider"])
+                if collider.get("type") != "surface_collider":
+                    raise ValueError("Native static roles currently require an explicit plane collider")
+                collider["point"] = (np.asarray(collider["point"]) + np.asarray(scene_config["mpm_origin"])).tolist()
+                bc_params.append(collider)
+        mpm_solver.import_particle_v_from_torch(velocity.contiguous(), device=device)
     # Note: boundary conditions may depend on mass, so the order cannot be changed!
     set_boundary_conditions(mpm_solver, bc_params, time_params)
 
@@ -331,22 +399,28 @@ if __name__ == "__main__":
         object_relations = load_object_relations(args.scene_relation_path)
         # Ficus is a single-object checkpoint; real multi-object runs must
         # provide persistent per-particle object/material labels here.
-        relation = RelationMPM(
-            n_materials=max(16, int(particle_material_id.max().item()) + 1 if particle_material_id is not None else 1),
-            local_radius=1.75 * material_params["grid_lim"] / material_params["n_grid"],
-            contact_radius=1.75 * material_params["grid_lim"] / material_params["n_grid"],
+        if not args.relation_full_checkpoint or args.relation_checkpoint:
+            raise ValueError("Verified relation inference requires a compatible full checkpoint")
+        relation_config = scene_config.get("relation", {})
+        checkpoint_settings = torch.load(args.relation_full_checkpoint, map_location="cpu", weights_only=True).get("metadata", {})
+        relation = PostStepRelationMPM(
+            n_materials=len(MATERIAL_VOCAB),
+            hidden_dim=relation_config.get("hidden_dim", checkpoint_settings.get("hidden_dim", 32)),
+            local_radius=relation_config.get("local_radius", checkpoint_settings.get("local_radius", 1.75 * material_params["grid_lim"] / material_params["n_grid"])),
+            contact_radius=relation_config.get("contact_radius", checkpoint_settings.get("contact_radius", 1.75 * material_params["grid_lim"] / material_params["n_grid"])),
+            max_tokens=relation_config.get("max_tokens", checkpoint_settings.get("max_tokens", 4096)),
+            event_check_interval=relation_config.get("event_check_interval", 1),
+            max_force=relation_config.get("max_force", 1.),
+            max_delta_v=relation_config.get("max_delta_v", checkpoint_settings.get("max_delta_v")),
+            use_state_features=relation_config.get("use_state_features", checkpoint_settings.get("use_state_features", False)),
+            residual_scale=relation_config.get("residual_scale", checkpoint_settings.get("residual_scale", 1.)),
+            contact_hysteresis=relation_config.get("contact_hysteresis", .2),
+            max_refresh_steps=relation_config.get("max_refresh_steps", 100),
+            diagnostics_path=str(Path(args.output_path) / "relation_events.jsonl"),
         ).to(device)
-        if args.relation_full_checkpoint:
-            full = torch.load(args.relation_full_checkpoint, map_location=device)["model"]
-            current = relation.state_dict()
-            usable = {k:v for k,v in full.items() if k in current and current[k].shape == v.shape}
-            relation.load_state_dict(usable, strict=False)
-            print("loaded full relation Transformer", args.relation_full_checkpoint, "tensors", len(usable))
-        if args.relation_checkpoint:
-            raise ValueError("Legacy acceleration LoRA checkpoints are incompatible with cached relation parameters; retrain the relation model")
-        if os.getenv("RELATION_ANALYTIC_PRIOR") == "1":
-            with torch.no_grad():
-                relation.force_output.bias[:] = torch.tensor([0.01, 0.01, 0.005, 0.0], device=device)
+        metadata = load_relation_checkpoint(relation, args.relation_full_checkpoint, MATERIAL_VOCAB)
+        relation.eval()
+        Path(args.output_path, "relation_model.json").write_text(json.dumps(metadata, indent=2))
         object_id = particle_object_id if particle_object_id is not None else torch.zeros(mpm_init_pos.shape[0], dtype=torch.long, device=device)
         material_id = particle_material_id if particle_material_id is not None else torch.zeros_like(object_id)
         mpm_solver.relation_step = lambda solver, dt: relation.step_solver(
@@ -390,11 +464,21 @@ if __name__ == "__main__":
     substep_dt = time_params["substep_dt"]
     frame_dt = time_params["frame_dt"]
     frame_num = time_params["frame_num"]
-    step_per_frame = int(frame_dt / substep_dt)
+    if not math.isfinite(frame_dt) or not math.isfinite(substep_dt) or frame_dt <= 0 or substep_dt <= 0 or frame_num <= 0:
+        raise ValueError("Positive finite timesteps and frame_num required")
+    step_per_frame = math.ceil(frame_dt / substep_dt)
+    substep_dt = frame_dt / step_per_frame
     opacity_render = opacity
     shs_render = shs
     height = None
     width = None
+    state_checks = []
+    frame_times = {"initial_render": "../render/first_frame.png", "simulation_png_start_time": frame_dt, "simulation_png_interval": frame_dt}
+    Path(args.output_path, "frame_times.json").write_text(json.dumps(frame_times, indent=2))
+    mass = wp.to_torch(mpm_solver.mpm_state.particle_mass)
+    if not torch.isfinite(mpm_init_vol).all() or not (mpm_init_vol > 0).all() or not torch.isfinite(mass).all() or not (mass > 0).all():
+        raise ValueError("Particle mass and volume must be finite and positive")
+    np.save(Path(args.output_path) / "particle_object_id.npy", particle_object_id.cpu().numpy() if particle_object_id is not None else np.zeros(len(mpm_init_pos), dtype=np.int32))
     for frame in tqdm(range(frame_num)):
         current_camera = get_camera_view(
             model_path,
@@ -418,6 +502,18 @@ if __name__ == "__main__":
         for step in range(step_per_frame):
             mpm_solver.p2g2p(frame, substep_dt, device=device)
 
+        x_check = mpm_solver.export_particle_x_to_torch()
+        v_check = mpm_solver.export_particle_v_to_torch()
+        f_check = wp.to_torch(mpm_solver.mpm_state.particle_F_trial).reshape(-1,3,3)
+        det = torch.linalg.det(f_check)
+        cfl = float(v_check.abs().max()) * substep_dt / float(mpm_solver.mpm_model.dx)
+        if not all(torch.isfinite(t).all() for t in (x_check,v_check,f_check)) or (det <= 0).any() or cfl > 1:
+            raise ValueError(f"Invalid/CFL-unsafe MPM state at frame {frame+1}")
+        contacts = mpm_solver.contact_diagnostics_snapshot()
+        with Path(args.output_path, "surface_contacts.jsonl").open("a") as contact_log:
+            contact_log.write(json.dumps(dict(frame=frame+1, **contacts)) + "\n")
+        state_checks.append(dict(frame=frame+1,time=(frame+1)*frame_dt,min_det=float(det.min()),frame_end_advective_cfl=cfl))
+        Path(args.output_path, "validation.json").write_text(json.dumps(dict(status="running", relation_enabled=args.enable_relation, dt=substep_dt, steps_per_frame=step_per_frame, frames=state_checks),indent=2))
         if args.output_ply or args.output_h5:
             save_data_at_frame(
                 mpm_solver,
@@ -444,7 +540,8 @@ if __name__ == "__main__":
             cov3D = apply_inverse_cov_rotations(cov3D, rotation_matrices)
             opacity = opacity_render
             shs = shs_render
-            if preprocessing_params["sim_area"] is not None:
+            if has_background:
+                rot = torch.cat([rot, torch.eye(3, device=device).expand(len(unselected_pos), -1, -1)], dim=0)
                 pos = torch.cat([pos, unselected_pos], dim=0)
                 cov3D = torch.cat([cov3D, unselected_cov], dim=0)
                 opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
@@ -453,7 +550,7 @@ if __name__ == "__main__":
             colors_precomp = convert_SH(shs, current_camera, gaussians, pos, rot)
             rendering, raddi = rasterize(
                 means3D=pos,
-                means2D=init_screen_points,
+                means2D=torch.zeros_like(pos, requires_grad=True),
                 shs=None,
                 colors_precomp=colors_precomp,
                 opacities=opacity,
@@ -472,8 +569,6 @@ if __name__ == "__main__":
                 255 * cv2_img,
             )
 
+    Path(args.output_path, "validation.json").write_text(json.dumps(dict(status="forward_complete", relation_enabled=args.enable_relation, learned_relation_verified=False, dt=substep_dt, steps_per_frame=step_per_frame, frames=state_checks, contact_events="see_solver_contact_log_if_enabled"),indent=2))
     if args.render_img and args.compile_video:
-        fps = int(1.0 / time_params["frame_dt"])
-        os.system(
-            f"ffmpeg -framerate {fps} -i {args.output_path}/%04d.png -c:v libx264 -s {width}x{height} -y -pix_fmt yuv420p {args.output_path}/output.mp4"
-        )
+        subprocess.run(["ffmpeg", "-framerate", str(1.0 / frame_dt), "-i", str(Path(args.output_path) / "%04d.png"), "-c:v", "libx264", "-s", f"{width}x{height}", "-y", "-pix_fmt", "yuv420p", str(Path(args.output_path) / "output.mp4")], check=True)

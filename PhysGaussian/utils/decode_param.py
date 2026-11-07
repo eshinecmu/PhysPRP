@@ -75,6 +75,9 @@ def decode_param_json(json_file):
 
     if "grid_v_damping_scale" in sim_params.keys():
         material_params["grid_v_damping_scale"] = sim_params["grid_v_damping_scale"]
+    for key in ("transfer_scheme", "grid_mass_epsilon"):
+        if key in sim_params:
+            material_params[key] = sim_params[key]
 
     if "additional_material_params" in sim_params.keys():
         additional_params = sim_params["additional_material_params"]
@@ -145,7 +148,9 @@ def decode_param_json(json_file):
     else:
         preprocessing_params["scale"] = 1.0
 
-    if "particle_filling" in sim_params.keys():
+    if sim_params.get("particle_filling") is not None:
+        if not isinstance(sim_params["particle_filling"], dict):
+            raise ValueError("particle_filling must be an object or null")
         preprocessing_params["particle_filling"] = sim_params["particle_filling"]
         filling_params = preprocessing_params["particle_filling"]
         if not "n_grid" in filling_params.keys():
@@ -316,6 +321,7 @@ def set_boundary_conditions(
                 friction=bc["friction"],
                 start_time=bc["start_time"],
                 end_time=bc["end_time"],
+                radius=bc.get("radius", 0.0),
             )
         elif bc["type"] == "release_particles_sequentially":
             assert "normal" in bc.keys()

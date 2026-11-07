@@ -1,0 +1,46 @@
+{
+  "scene_scale": 0.5,
+  "default_role": "background",
+  "required_objects": ["white_bird_toy_000", "orange_box_000"],
+  "objects": {
+    "white_bird_toy_000": {"role": "dynamic", "velocity": [0.0, 0.0, 0.0]}
+  },
+  "object_prompt": "List only the white bird toy and the orange box if each is visible. Use exactly the noun phrase white bird toy for the white toy. Return only noun phrases, one per line, no explanation, no numbering. Do not list the floor: it is added separately. Exclude other background objects.",
+  "rest_vlm": "gpt4o",
+  "material_vlm": "gpt",
+  "mpm_origin": [1.0, 1.0, 0.0],
+  "opacity_threshold": 0.02,
+  "rotation_degree": [],
+  "rotation_axis": [],
+  "substep_dt": 0.00002,
+  "frame_dt": 0.025,
+  "frame_num": 48,
+  "material": "jelly",
+  "E": 500000,
+  "nu": 0.4,
+  "density": 80,
+  "g": [0.0, -9.81, 0.0],
+  "n_grid": 96,
+  "grid_lim": 2.5,
+  "particle_filling": null,
+  "boundary_conditions": [
+    {"type": "bounding_box"},
+    {"type": "surface_collider", "point": [1.0, 0.68, 0.7], "normal": [0.0, 1.0, 0.0], "surface": "separate", "friction": 0.3, "start_time": 0.0, "end_time": 1000.0}
+  ],
+  "mpm_space_vertical_upward_axis": [0.0, 1.0, 0.0],
+  "mpm_space_viewpoint_center": [1.0, 1.0, 1.0],
+  "default_camera_index": 0,
+  "show_hint": false,
+  "move_camera": false,
+  "ground_from_pointmap": true,
+  "gravity_from_ground": true,
+  "model_scope": "full",
+  "assumptions": {
+    "scene_scale": "explicit unmeasured 0.5 meters/sourceunit; no video calibration",
+    "initial_velocity": "explicit zero release",
+    "floor": "single-image MoGe pointmap and actual floor mask; model estimate, no video fitting",
+    "constitutive_model": "one scene-wide jelly law; semantic material sets E/nu/density only",
+    "background": "full scope uses every validated REST3D mask; non-dynamic objects remain render-only unless explicitly configured as colliders",
+    "duration": "48 frames at 0.025 seconds equals 1.2 seconds"
+  }
+}

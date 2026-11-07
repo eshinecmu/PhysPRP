@@ -33,6 +33,8 @@ class MPMModelStruct:
     ####### for damping
     rpic_damping: float
     grid_v_damping_scale: float
+    transfer_scheme: int  # 0: B-spline gradients; 1: MLS-MPM
+    grid_mass_epsilon: float
 
     ####### for PhysGaussian: covariance
     update_cov_with_F: int

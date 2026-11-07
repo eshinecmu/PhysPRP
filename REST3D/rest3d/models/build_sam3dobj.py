@@ -126,6 +126,8 @@ def make_scene_untextured_mesh(*outputs, in_place=False, compute_axis=False):
           vertices = mesh.vertices.astype(np.float32) @ _R_YUP_TO_ZUP
           R_l2c = quaternion_to_matrix(output["rotation"])
 
+          # Raw exports preserve the inferred pose. The historical correction
+          # below is opt-in; native export rejects it to avoid mesh/GS mismatch.
           # Detect upside-down placement: R_l2c[0,2,:] (row 2) is where local +Z
           # (canonical "up") lands in the scene. If Y-component < 0, object is inverted.
           # Fix with a 180° rotation; which axis depends on R_l2c[0,1,2]:
@@ -133,7 +135,7 @@ def make_scene_untextured_mesh(*outputs, in_place=False, compute_axis=False):
           #   R_l2c[1,2] < 0: X-axis flip (negate Y,Z) — local +Y → scene -Z (faces cam)
           # Both are proper rotations (det=+1), so winding order is preserved.
           local_z_in_scene = R_l2c[0, 2, :]
-          if local_z_in_scene[1] < 0:
+          if output.get("apply_orientation_fix", False) and local_z_in_scene[1] < 0:
               if R_l2c[0, 1, 2] > 0:
                   vertices[:, 0] *= -1
                   vertices[:, 2] *= -1

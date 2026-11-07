@@ -38,7 +38,7 @@ sys.excepthook = _excepthook
 def build_agent_components(args):
     """Build the segmentation agent: a SAM3 processor + a VLM backend."""
     # Build SAM3 processor
-    model = build_sam3_image_model()
+    model = build_sam3_image_model(checkpoint_path=os.getenv("SAM3_CHECKPOINT"))
     sam3_processor = Sam3Processor(model, confidence_threshold=0.5)
 
     # llm_config is used only to name output files
@@ -735,7 +735,7 @@ def main():
                             agent_succeeded = True
 
                     if not agent_succeeded:
-                        # Floor agent failed in 10 rounds: try SAM3 synonyms first, then fall back to copy
+                        # Floor agent failed in 10 rounds: try SAM3 synonyms; fail if no genuine floor mask
                         FLOOR_SYNONYMS = [
                             "carpet", "rug", "floor mat", "flooring",
                             "hardwood floor", "tile floor", "ground",
@@ -744,14 +744,14 @@ def main():
                         for synonym in FLOOR_SYNONYMS:
                             logger.info(f"    🔄 floor synonym retry: '{synonym}'")
                             # call_sam_service builds the save path internally; reconstruct it for the check
-                            prompt_safe_syn = synonym.replace("/", "_").replace(" ", "_")
+                            prompt_safe_syn = synonym.replace("/", "_")
                             # output_folder_path subdir name is image_path.replace("/", "-")
                             syn_sub = abs_img_path.replace("/", "-")
                             syn_json = os.path.join(agent_output_dir, "sam_synonym",
                                                     syn_sub, f"{prompt_safe_syn}.json")
                             os.makedirs(os.path.dirname(syn_json), exist_ok=True)
                             call_sam_service(
-                                abs_img_path, synonym,
+                                image_path=abs_img_path, text_prompt=synonym,
                                 output_folder_path=os.path.join(agent_output_dir, "sam_synonym"),
                             )
                             if os.path.exists(syn_json):
@@ -769,17 +769,10 @@ def main():
                                     break
 
                         if not synonym_succeeded:
-                            # All synonyms failed -> copy the most floor-like object mask
-                            result_json = _pick_most_floor_like(seg_obj_dir, image)
-                            if result_json is not None:
-                                result_json["text_prompt"] = "the floor"
-                                result_json["image_path"] = abs_img_path
-                                json.dump(result_json, open(floor_json_path, "w"), indent=4)
-                                masks, _ = decode_agent_masks(floor_json_path)
-                                if len(masks) > 0:
-                                    save_seg_obj(image, masks[0], out_path=floor_png_path)
-                            else:
-                                logger.info(f"    ⚠️  floor: agent+synonyms failed and no object masks available, skipping")
+                            raise RuntimeError(
+                                "Floor segmentation failed after agent and synonym attempts; "
+                                "refusing to copy another object's mask as the floor"
+                            )
                     continue  # Skip Step 3: floor already handled above
                 else:
                     run_single_image_inference(

@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 from engine_utils import *
@@ -55,6 +56,8 @@ class MPM_Simulator_WARP:
         self.mpm_model.rpic_damping = 0.0  # 0.0 if no damping (apic). -1 if pic
 
         self.mpm_model.grid_v_damping_scale = 1.1  # globally applied
+        self.mpm_model.transfer_scheme = 0
+        self.mpm_model.grid_mass_epsilon = 0.0
 
         self.mpm_state = MPMStateStruct()
 
@@ -139,6 +142,49 @@ class MPM_Simulator_WARP:
         self.particle_velocity_modifiers = []
         self.particle_velocity_modifier_params = []
         self.relation_step = None
+        self._surface_counter_indices = set()
+        self._contact_counters = wp.zeros(4, dtype=int, device=device)
+        self._contact_diagnostics_enabled = False
+        self._contact_active = {}
+        self.contact_event_revision = 0
+        self._contact_totals = {}
+        self._contact_events = []
+
+    def enable_contact_diagnostics(self, enabled=True):
+        """Opt-in synchronous counters from the actual surface-collider kernel."""
+        self._contact_diagnostics_enabled = bool(enabled)
+
+    def contact_diagnostics_snapshot(self, reset=True):
+        """Drain per-frame totals/events; no particle or grid snapshots are retained."""
+        result = {"definition": "occupied_grid_nodes_in_surface_constraint",
+                  "time": float(self.time), "surfaces": list(self._contact_totals.values()),
+                  "events": list(self._contact_events)}
+        if reset:
+            self._contact_totals = {}
+            self._contact_events = []
+        return result
+
+    def _collect_surface_contacts(self, surface_index, dt):
+        occupied, inward, corrected, constrained = map(int, self._contact_counters.numpy())
+        active = constrained > 0
+        previous = self._contact_active.get(surface_index, False)
+        if active != previous:
+            self.contact_event_revision += 1
+            self._contact_events.append({"surface": surface_index, "time": float(self.time),
+                                         "event": "contact_begin" if active else "contact_end",
+                                         "constraint_nodes": constrained})
+        self._contact_active[surface_index] = active
+        total = self._contact_totals.setdefault(surface_index, {
+            "surface": surface_index, "substeps": 0, "active_substeps": 0,
+            "occupied_node_visits": 0, "inward_node_visits": 0, "corrected_node_visits": 0,
+            "max_constraint_nodes": 0, "latest_constraint_nodes": 0})
+        total["substeps"] += 1
+        total["active_substeps"] += int(active)
+        total["occupied_node_visits"] += occupied
+        total["inward_node_visits"] += inward
+        total["corrected_node_visits"] += corrected
+        total["max_constraint_nodes"] = max(total["max_constraint_nodes"], constrained)
+        total["latest_constraint_nodes"] = constrained
 
     # the h5 file should store particle initial position and volume.
     def load_from_sampling(
@@ -206,7 +252,7 @@ class MPM_Simulator_WARP:
         # assert tensor_x.shape[0] == tensor_cov.reshape(-1, 6).shape[0]
         self.initialize(self.n_particles, n_grid, grid_lim, device=device)
 
-        self.import_particle_x_from_torch(tensor_x, device)
+        self.import_particle_x_from_torch(tensor_x, device=device)
         self.mpm_state.particle_vol = wp.from_numpy(
             tensor_volume.detach().clone().cpu().numpy(), dtype=float, device=device
         )
@@ -246,6 +292,16 @@ class MPM_Simulator_WARP:
         self.set_parameters_dict(device, kwargs)
 
     def set_parameters_dict(self, kwargs={}, device="cuda:0"):
+        if "transfer_scheme" in kwargs and kwargs["transfer_scheme"] not in ("gradient", "mls"):
+            raise ValueError("transfer_scheme must be 'gradient' or 'mls'")
+        if "grid_mass_epsilon" in kwargs:
+            epsilon = float(kwargs["grid_mass_epsilon"])
+            if not math.isfinite(epsilon) or epsilon < 0:
+                raise ValueError("grid_mass_epsilon must be finite and nonnegative")
+        if "transfer_scheme" in kwargs:
+            self.mpm_model.transfer_scheme = int(kwargs["transfer_scheme"] == "mls")
+        if "grid_mass_epsilon" in kwargs:
+            self.mpm_model.grid_mass_epsilon = epsilon
         if "material" in kwargs:
             if kwargs["material"] == "jelly":
                 self.mpm_model.material = 0
@@ -401,9 +457,6 @@ class MPM_Simulator_WARP:
             device=device,
         )
 
-        if self.relation_step is not None:
-            self.relation_step(self, dt)
-
         # apply pre-p2g operations on particles
         for k in range(len(self.pre_p2g_operations)):
             wp.launch(
@@ -477,18 +530,15 @@ class MPM_Simulator_WARP:
             "apply_BC_on_grid", synchronize=True, print=False, dict=self.time_profile
         ):
             for k in range(len(self.grid_postprocess)):
-                wp.launch(
-                    kernel=self.grid_postprocess[k],
-                    dim=grid_size,
-                    inputs=[
-                        self.time,
-                        dt,
-                        self.mpm_state,
-                        self.mpm_model,
-                        self.collider_params[k],
-                    ],
-                    device=device,
-                )
+                inputs = [self.time, dt, self.mpm_state, self.mpm_model, self.collider_params[k]]
+                surface_counter = k in self._surface_counter_indices
+                if surface_counter:
+                    if self._contact_diagnostics_enabled:
+                        self._contact_counters.zero_()
+                    inputs.extend([int(self._contact_diagnostics_enabled), self._contact_counters])
+                wp.launch(kernel=self.grid_postprocess[k], dim=grid_size, inputs=inputs, device=device)
+                if surface_counter and self._contact_diagnostics_enabled:
+                    self._collect_surface_contacts(k, dt)
                 if self.modify_bc[k] is not None:
                     self.modify_bc[k](self.time, dt, self.collider_params[k])
 
@@ -502,6 +552,10 @@ class MPM_Simulator_WARP:
                 inputs=[self.mpm_state, self.mpm_model, dt],
                 device=device,
             )  # x, v, C, F_trial are updated
+
+        # Residual velocities act on this substep's baseline output.
+        if self.relation_step is not None:
+            self.relation_step(self, dt)
 
         #### CFL check ####
         # particle_v = self.mpm_state.particle_v.numpy()
@@ -635,7 +689,11 @@ class MPM_Simulator_WARP:
         friction=0.0,
         start_time=0.0,
         end_time=999.0,
+        radius=0.0,
     ):
+        radius = float(radius)
+        if not math.isfinite(radius) or radius < 0:
+            raise ValueError("Collider radius must be finite and nonnegative")
         point = list(point)
         # Normalize normal
         normal_scale = 1.0 / wp.sqrt(float(sum(x**2 for x in normal)))
@@ -647,6 +705,7 @@ class MPM_Simulator_WARP:
 
         collider_param.point = wp.vec3(point[0], point[1], point[2])
         collider_param.normal = wp.vec3(normal[0], normal[1], normal[2])
+        collider_param.radius = radius
 
         if surface == "sticky" and friction != 0:
             raise ValueError("friction must be 0 on sticky surfaces.")
@@ -670,6 +729,8 @@ class MPM_Simulator_WARP:
             state: MPMStateStruct,
             model: MPMModelStruct,
             param: Dirichlet_collider,
+            diagnostics: int,
+            counts: wp.array(dtype=int),
         ):
             grid_x, grid_y, grid_z = wp.tid()
             if time >= param.start_time and time < param.end_time:
@@ -681,7 +742,9 @@ class MPM_Simulator_WARP:
                 n = wp.vec3(param.normal[0], param.normal[1], param.normal[2])
                 dotproduct = wp.dot(offset, n)
 
-                if dotproduct < 0.0:
+                # ponytail: a finite planar disk approximates a tabletop; curved contact needs a mesh collider.
+                if dotproduct < 0.0 and (param.radius == 0.0 or wp.length(offset - dotproduct * n) <= param.radius):
+                    before = state.grid_v_out[grid_x, grid_y, grid_z]
                     if param.surface_type == 0:
                         state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
                             0.0, 0.0, 0.0
@@ -716,10 +779,21 @@ class MPM_Simulator_WARP:
                             ) * wp.normalize(
                                 v
                             )  # apply friction here
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                            0.0, 0.0, 0.0
-                        )
+                        state.grid_v_out[grid_x, grid_y, grid_z] = v
+                    if diagnostics != 0 and state.grid_m[grid_x, grid_y, grid_z] > 0.0:
+                        wp.atomic_add(counts, 0, 1)
+                        vn = wp.dot(before, n)
+                        if vn < 0.0:
+                            wp.atomic_add(counts, 1, 1)
+                        after = state.grid_v_out[grid_x, grid_y, grid_z]
+                        if wp.length(after - before) > 0.0:
+                            wp.atomic_add(counts, 2, 1)
+                        # Sticky/cut/slip constrain occupied nodes; separating contact
+                        # constrains only inward motion (outward nodes are not contact).
+                        if param.surface_type == 0 or param.surface_type == 11 or param.surface_type == 1 or vn < 0.0:
+                            wp.atomic_add(counts, 3, 1)
 
+        self._surface_counter_indices.add(len(self.grid_postprocess))
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)
 

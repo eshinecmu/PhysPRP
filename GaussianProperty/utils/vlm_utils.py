@@ -20,7 +20,7 @@ def GPT4V(image_path, prompt):
     data = base64.b64encode(open(image_path, 'rb').read()).decode()
     client, model = _client_and_model('gpt-4o-mini')
     r = client.chat.completions.create(model=model, messages=[{'role':'user','content':[{'type':'text','text':prompt},{'type':'image_url','image_url':{'url':f'data:image/jpeg;base64,{data}'}}]}])
-    return r.choices[0]
+    return r.choices[0].message.content
 
 
 def get_image_files(directory):

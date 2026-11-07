@@ -1,3 +1,5 @@
+See [the PhysPRP single-image inference guide](INFERENCE.md) for the current entry point, runtime contract, and acceptance limits. Older examples below are historical.
+
 # PhysGaussian: Physics-Integrated 3D Gaussians for Generative Dynamics
 
 ### [[Project Page](https://xpandora.github.io/PhysGaussian/)] [[arXiv](https://arxiv.org/abs/2311.12198)] [[Video](https://www.youtube.com/watch?v=V96GfcMUH2Q)]

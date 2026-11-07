@@ -170,7 +170,7 @@ def get_camera_view(
         fovx = focal2fov(raw_camera["fx"], width)
         fovy = focal2fov(raw_camera["fy"], height)
 
-        return GSCamera(
+        camera = GSCamera(
             colmap_id=0,
             R=R,
             T=T,
@@ -181,3 +181,9 @@ def get_camera_view(
             image_name="fake",
             uid=0,
         )
+
+        if "cx" in raw_camera and "cy" in raw_camera:
+            camera.projection_matrix[2, 0] = (2 * raw_camera["cx"] + 1) / width - 1
+            camera.projection_matrix[2, 1] = (2 * raw_camera["cy"] + 1) / height - 1
+            camera.full_proj_transform = camera.world_view_transform @ camera.projection_matrix
+        return camera

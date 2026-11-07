@@ -29,9 +29,9 @@ def generate_vlm_response_gpt4o(messages, save_dir=None, save_name='test'):
     import time
 
     # Get API key from environment
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("LAB_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable not set")
+        raise ValueError("Set LAB_LLM_API_KEY or OPENAI_API_KEY")
 
     # Convert messages to GPT-4o format
     gpt_messages = []
@@ -57,7 +57,7 @@ def generate_vlm_response_gpt4o(messages, save_dir=None, save_name='test'):
     }
 
     payload = {
-        "model": "gpt-4o",
+        "model": os.getenv("LAB_LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o",
         "messages": gpt_messages,
         "max_tokens": 4096,
         "temperature": 0
@@ -68,7 +68,7 @@ def generate_vlm_response_gpt4o(messages, save_dir=None, save_name='test'):
     for attempt in range(max_retries):
         try:
             response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
+                (os.getenv("LAB_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/") + "/chat/completions",
                 headers=headers,
                 json=payload,
                 timeout=60

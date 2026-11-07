@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PhysGaussian"))
+from gaussian_property_adapter import material_parameters
 
 
 MODELS = {"jelly", "metal", "sand", "foam", "snow", "plasticine"}
@@ -29,8 +34,13 @@ def validate(prior: dict) -> dict:
         raw = prior[name]
         if isinstance(raw, dict) and "range" in raw:
             low, high = map(float, raw["range"])
+            if not math.isfinite(low) or not math.isfinite(high):
+                raise ValueError(f"{name}.range must be finite")
             if not low <= result[{"young_modulus_pa": "E", "poisson_ratio": "nu", "density_kg_m3": "density"}[name]] <= high:
                 raise ValueError(f"{name}.value is outside its declared range")
+    audit = material_parameters(result)
+    result.update(audit["actual"])
+    result["material_parameters"] = audit
     return result
 
 

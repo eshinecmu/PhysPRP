@@ -363,6 +363,10 @@ def p2g_apic_with_stress(state: MPMStateStruct, model: MPMModelStruct, dt: float
                         C = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
                     elastic_force = -state.particle_vol[p] * stress * dweight
+                    if model.transfer_scheme == 1:
+                        elastic_force = -state.particle_vol[p] * stress * (
+                            4.0 * model.inv_dx * model.inv_dx * weight * dpos
+                        )
                     v_in_add = (
                         weight
                         * state.particle_mass[p]
@@ -381,13 +385,16 @@ def grid_normalization_and_gravity(
     state: MPMStateStruct, model: MPMModelStruct, dt: float
 ):
     grid_x, grid_y, grid_z = wp.tid()
-    if state.grid_m[grid_x, grid_y, grid_z] > 1e-15:
+    mass = state.grid_m[grid_x, grid_y, grid_z]
+    if mass > 1e-15 or (model.transfer_scheme == 1 and mass > 0.0):
         v_out = state.grid_v_in[grid_x, grid_y, grid_z] * (
-            1.0 / state.grid_m[grid_x, grid_y, grid_z]
+            1.0 / (mass + model.grid_mass_epsilon)
         )
         # add gravity
         v_out = v_out + dt * model.gravitational_accelaration
         state.grid_v_out[grid_x, grid_y, grid_z] = v_out
+    elif model.transfer_scheme == 1:
+        state.grid_v_out[grid_x, grid_y, grid_z] = dt * model.gravitational_accelaration
 
 
 @wp.kernel
@@ -432,6 +439,8 @@ def g2p(state: MPMStateStruct, model: MPMModelStruct, dt: float):
         state.particle_v[p] = new_v
         state.particle_x[p] = state.particle_x[p] + dt * new_v
         state.particle_C[p] = new_C
+        if model.transfer_scheme == 1:
+            new_F = new_C
         I33 = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         F_tmp = (I33 + new_F * dt) * state.particle_F[p]
         state.particle_F_trial[p] = F_tmp

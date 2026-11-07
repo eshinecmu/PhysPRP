@@ -50,7 +50,7 @@ if not SAM3D_OBJECTS_ROOT:
         "checkout, e.g. `export SAM3D_OBJECTS_ROOT=/path/to/sam-3d-objects`."
     )
 TAG = os.environ.get("SAM3D_OBJECTS_TAG", "hf")
-config_path = os.path.join(SAM3D_OBJECTS_ROOT, "checkpoints", TAG, "pipeline.yaml")
+config_path = os.environ.get("SAM3D_CONFIG", os.path.join(SAM3D_OBJECTS_ROOT, "checkpoints", TAG, "pipeline.yaml"))
 if not os.path.isfile(config_path):
     raise FileNotFoundError(
         f"SAM-3D-Objects pipeline config not found at {config_path}. "
@@ -71,6 +71,8 @@ def inference_mesh_with_cache(image, masks_list, object_names, output_obj_dir, o
     use_cache = args.use_cache and not args.force_reinfer
     cache_exists = all(
         (os.path.exists(os.path.join(output_obj_dir, f"{obj_name}.obj")) and
+         os.path.exists(os.path.join(output_obj_dir, f"{obj_name}.ply")) and
+         os.path.exists(os.path.join(output_obj_dir, f"{obj_name}_pose.json")) and
          os.path.exists(os.path.join(output_bbox_axes_dir, f"{obj_name}_bbox_axes.npz")))
         for obj_name in object_names
     )
@@ -116,10 +118,14 @@ def inference_mesh_with_cache(image, masks_list, object_names, output_obj_dir, o
 
         # Run SAM3D inference
         outputs = []
-        for mask_path in masks_list:
+        for obj_name, mask_path in zip(object_names, masks_list):
             logger.info(f'------>    processing mask: {mask_path}')
             mask = load_mask(mask_path)
             output = inference(image, mask, seed=42)
+            if output.get("glb") is None:
+                raise RuntimeError(f"SAM3D produced no mesh for {obj_name}")
+            from rest3d.utils.native_export import export_native_object
+            export_native_object(output, obj_name, mask_path, output_obj_dir)
             outputs.append(output.copy())
 
         # Save raw pre-transform GLB meshes for debugging
@@ -497,6 +503,8 @@ def main():
         action="store_true",
         help="Force re-inference even if cache exists"
     )
+    parser.add_argument("--object_names_file", type=str,
+                        help="JSON object selection from REST3D scene-tree scope adapter")
     parser.add_argument(
         "--debug_vis",
         action="store_true",
@@ -589,6 +597,16 @@ def main():
             for mask in glob(os.path.join(mask_dir, ext))
         )
         object_names = [os.path.splitext(os.path.basename(m))[0] for m in masks_list]
+        if args.object_names_file:
+            with open(args.object_names_file, encoding="utf-8") as f:
+                selection = json.load(f)
+            selected = set(selection["objects"])
+            missing = selected - set(object_names)
+            if missing:
+                raise ValueError(f"Selected REST3D masks are missing: {sorted(missing)}")
+            masks_list = [m for m, name in zip(masks_list, object_names) if name in selected]
+            object_names = [name for name in object_names if name in selected]
+            logger.info(f"Model scope {selection['scope']}: reconstructing {object_names}")
 
         # ========================================================================
         # Raw mesh inference with SAM3D-Objects
