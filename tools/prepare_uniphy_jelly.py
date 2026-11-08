@@ -32,8 +32,8 @@ def to_physcore_episode(data):
         raise ValueError("PhysCoRe adaptation requires a unit grid and APIC (rpic_damping=0)")
     if not 0. <= float(config["grid_v_damping_scale"]) <= 1.:
         raise ValueError("PhysCoRe grid damping must be in [0,1]")
-    if data["selection"].any() or torch.unique(data["object_id"]).numel() != 1 or data.get("object_relations"):
-        raise ValueError("PhysCoRe adaptation requires one fully simulated object without object relations")
+    if data["selection"].any() or data.get("object_relations"):
+        raise ValueError("PhysCoRe adaptation requires fully simulated particles without explicit object constraints")
     for key in ("volume", "density", "mass"):
         if not torch.equal(data[key], data[key][0].expand_as(data[key])):
             raise ValueError(f"PhysCoRe's scalar particle {key} requires uniform {key}")

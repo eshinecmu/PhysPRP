@@ -584,6 +584,8 @@ def make_physcore_engine(episode, rollout_config, device, corrector=None, cadenc
     if worldparticle and cadence != 1:
         raise ValueError("WorldParticle correction currently requires h=1")
     material_id = episode["material_id"].to(device) if worldparticle and not material_only else None
+    history_frames = getattr(corrector, "history_frames", 0)
+    object_id = torch.unique(episode["object_id"].to(device), return_inverse=True)[1] if history_frames else None
     if worldparticle:
         from physcore.particle_flow.rollout import BatchedDifferentiableRolloutEngine
         class CorrectionEngine(BatchedDifferentiableRolloutEngine):
@@ -591,12 +593,17 @@ def make_physcore_engine(episode, rollout_config, device, corrector=None, cadenc
                 self._gvc_active = True
             def enable_corrector(self, enabled):
                 self._gvc_active = bool(enabled)
-            def forward(self, positions, velocities, F, deltas, log_E, nu, **kwargs):
+            def forward(self, positions, velocities, F, deltas, log_E, nu, *, history=None, **kwargs):
                 self._gvc_log_E, self._gvc_nu = log_E, nu
+                self._particle_history = positions.unsqueeze(0)[:0] if history is None else history
                 try:
-                    return super().forward(positions, velocities, F, deltas, log_E, nu, **kwargs)
+                    out = super().forward(positions, velocities, F, deltas, log_E, nu, **kwargs)
+                    if history_frames:
+                        out["particle_history"] = self._particle_history
+                    return out
                 finally:
                     self._gvc_log_E = self._gvc_nu = None
+                    self._particle_history = None
     else:
         from physcore.particle_flow.rfd_engine import GVCRolloutEngine as CorrectionEngine
     config = OmegaConf.to_container(rollout_config, resolve=True) if OmegaConf.is_config(rollout_config) else dict(rollout_config)
@@ -618,14 +625,16 @@ def make_physcore_engine(episode, rollout_config, device, corrector=None, cadenc
             def with_particle_state(x, v, C, F, stress, *args, **kwargs):
                 model._worldparticle_state = (x, v, F, C)
                 try:
-                    return original(x, v, C, F, stress, *args, **kwargs)
+                    result = original(x, v, C, F, stress, *args, **kwargs)
+                    self._particle_history = torch.cat((x.unsqueeze(0), self._particle_history[:history_frames - 1]))
+                    return result
                 finally:
                     del model._worldparticle_state
             model.p2g2p = with_particle_state
             def correct_grid(model):
                 if self._gvc_active:
                     delta = corrector(*model._worldparticle_state, self._gvc_log_E, self._gvc_nu,
-                                      model.grid_m, physics, material_id)
+                                      model.grid_m, physics, material_id, object_id, self._particle_history)
                     model.grid_mv = model.grid_mv + delta
             model.post_grid_process.append(correct_grid)
 
@@ -646,6 +655,7 @@ def make_physcore_engine(episode, rollout_config, device, corrector=None, cadenc
             return solver, state
 
     engine = TrajectoryEngine(OmegaConf.create(config), device=device)
+    engine.particle_history_frames = history_frames
     if physics.get("elasticity_model") == "NeoHookeanElasticity":
         class NeoHookeanElasticity(torch.nn.Module):
             """Original UniPhy/PAC Kirchhoff stress; the upstream MPM and RfD remain unchanged."""
@@ -674,11 +684,15 @@ def physcore_state(episode, index, device):
 
 def physcore_advance(engine, state, material, steps, **controls):
     """No GT reset inside a segment; the official grid hook updates x/v/F/C together."""
+    if "particle_history" in state:
+        controls["history"] = state["particle_history"]
     out = engine(state["x"], state["v"], state["F"],
                  state["x"].new_zeros((steps,) + tuple(state["x"].shape)),
                  material["log_E"], material["nu"], C=state["C"], **controls)
     state = {"x": out["predicted_positions"][-1], "v": out["final_velocity"],
              "F": out["final_deformation_gradient"], "C": out["final_C"]}
+    if "particle_history" in out:
+        state["particle_history"] = out["particle_history"]
     if any(not torch.isfinite(value).all() for value in state.values()):
         raise ValueError("Non-finite official PhysCoRe rollout state")
     return out, state
@@ -730,7 +744,11 @@ def train_material_step(model, engine, optimizer, batch,
 
 def physcore_gt_step(engine, episode, index, material, device):
     """One independent observed-state pair; never accept a prior predicted state."""
-    return physcore_advance(engine, physcore_state(episode, index, device), material, 1)
+    state = physcore_state(episode, index, device)
+    if engine.particle_history_frames:
+        first = max(0, index - engine.particle_history_frames)
+        state["particle_history"] = episode["particle_coords"][first:index].flip(0).unsqueeze(1).to(device)
+    return physcore_advance(engine, state, material, 1)
 
 
 def train_physcore(args, overrides):
@@ -849,7 +867,7 @@ def train_physcore(args, overrides):
                         selection="mean validation one-step position MSE, including zero correction")
     if getattr(model, "worldparticle_core", False):
         contract.pop("gvc")
-        contract.update(schema="physprp-worldparticle-single-step-v1", correction=OmegaConf.to_container(correction, resolve=True),
+        contract.update(schema="physprp-worldparticle-single-step-v2", correction=OmegaConf.to_container(correction, resolve=True),
                         model=OmegaConf.to_container(cfg.model, resolve=True), worldparticle=model.provenance())
 
     context = None

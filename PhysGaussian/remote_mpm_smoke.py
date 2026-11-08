@@ -335,16 +335,64 @@ def physcore_split_checks(config_path, device):
           f"zero_head=per_episode_baseline, shared_head_gradient_contributions={contributions}, heldout_rollouts=0")
 
 
+def worldparticle_context_check(device):
+    from omegaconf import OmegaConf
+    from train_relation_full import make_physcore_engine, physcore_advance
+    from PhysGaussian.worldparticle_grid_correction import WorldParticlePhysCoreCorrector
+
+    root = Path(__file__).resolve().parents[1] / "third_party"
+    sys.path.insert(0, str(root / "PhysCoRe"))
+    torch.cuda.set_device(device)
+    model = WorldParticlePhysCoreCorrector(root / "WorldParticle", 2).to(device)
+    scene = make_scene()
+    x, v, F = (torch.as_tensor(scene[key], device=device)[None] for key in ("x", "v", "F"))
+    x = x / 2
+    ids = torch.as_tensor(scene["object_id"], device=device)
+    volume = .04**3
+    physics = dict(dt=.001, n_grid=24, gravity=[0., 0., -9.8], density=1000.,
+                   damping=1., volume=volume, mass=1000.*volume,
+                   boundary_conditions=[dict(point=[0., 0., .1], normal=[0., 0., 1.],
+                                             surface="separate", friction=0.)])
+    cfg = OmegaConf.create(dict(clip_bound=.5, elasticity_model="CorotatedElasticity",
+                                plasticity_model="IdentityPlasticity", use_explicit_rigid_contact=False))
+    engine = make_physcore_engine(dict(physcore_adapter=physics, object_id=ids*100+7,
+                                       material_id=torch.zeros_like(ids)), cfg, device, model)
+    state = dict(x=x, v=v, F=F, C=torch.zeros_like(F))
+    material = dict(log_E=x.new_full(x.shape[:2], 7.6), nu=x.new_full(x.shape[:2], .3))
+    with torch.no_grad():
+        _, whole = physcore_advance(engine, state, material, 3)
+        _, first = physcore_advance(engine, state, material, 1)
+        _, split = physcore_advance(engine, first, material, 2)
+        torch.testing.assert_close(whole["particle_history"], split["particle_history"])
+        torch.testing.assert_close(whole["x"], split["x"])
+        context = model.particle_context(x[0], v[0], ids, (x - .001).unsqueeze(0))
+        joined = model.particle_context(x[0], v[0], torch.zeros_like(ids), (x - .001).unsqueeze(0))
+        assert context[:, 17].max() > 0 and not joined[:, 17].any()
+        assert context[:, -9].eq(1).all() and not context[:, -5].any()
+        model.head.weight.normal_(std=1e-3)
+    _, prediction = physcore_advance(engine, first, material, 1)
+    prediction["v"].square().mean().backward()
+    for module in (model.context_projection, model.backbone.local_feature_extractor.conv0_fluid,
+                   model.backbone.super_particle_cross_attn_feat, model.backbone.super_particle_decoder):
+        assert any(p.grad is not None and p.grad.isfinite().all() and p.grad.norm() > 0
+                   for p in module.parameters()), type(module).__name__
+    print("WorldParticle two-object MPM context check passed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0", help="cpu or cuda:0 in an existing Warp environment")
     parser.add_argument("--trajectory", help="Also check original UniPhy jelly against explicitly compatible MLS transfers")
     parser.add_argument("--physcore", action="store_true", help="Check official PhysCoRe with --trajectory instead of the legacy post-step path")
     parser.add_argument("--physcore-splits", help="Check explicit episode splits and two train-episode gradients using a training YAML")
+    parser.add_argument("--worldparticle-context", action="store_true", help="Check two-object history and gradients through PhysCoRe MPM on CUDA")
     args = parser.parse_args()
     device = torch.device(args.device)
     wp.config.kernel_cache_dir = os.environ.get("PHYSPRP_WARP_CACHE_DIR", str(Path(__file__).resolve().parents[1] / ".cache" / "warp"))
     wp.init()
+    if args.worldparticle_context:
+        worldparticle_context_check(device)
+        return
     if args.physcore_splits:
         if args.physcore or args.trajectory:
             parser.error("--physcore-splits is a separate check; do not combine with --physcore/--trajectory")

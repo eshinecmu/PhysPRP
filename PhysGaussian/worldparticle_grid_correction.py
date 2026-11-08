@@ -178,6 +178,7 @@ def attach_corrector(solver,model,object_id,material_id):
 class WorldParticlePhysCoreCorrector(nn.Module):
     """Original WorldParticle core with particle-state inputs and a physical P2G output adapter."""
     worldparticle_core = True
+    history_frames = 3
 
     def __init__(self, source_root, n_materials, max_delta_v=.002,
                  width=32, merge_iterations=3, decoder_layers=2):
@@ -197,6 +198,7 @@ class WorldParticlePhysCoreCorrector(nn.Module):
         self.source_root, self.merge_iterations = root, int(merge_iterations)
         self.max_delta_v = float(max_delta_v)
         self.material_embedding = nn.Embedding(n_materials, 4)
+        self.context_projection = nn.Linear(33, 32, bias=False)
         self.backbone = ParticleNetworkCrossAttnLocalFeature(
             cconv_embedding_dim=width, particle_radius=.01, radius_scale=1.5,
             data='real_world', use_topology_conv=False, other_feats_channels=32,
@@ -223,6 +225,7 @@ class WorldParticlePhysCoreCorrector(nn.Module):
             attention_backend=os.environ['ATTN_IMPL'],
             pipeline='original CConv -> k-partite merging -> RoPE -> SuperParticleDecoder -> original output head',
             physical_features='F-I, dt*C, log(E/2000), nu, log(rho/1000), log(dt/.001), log(volume/1e-6), Neo-Hookean flag, gravity/9.8, sticky flag, material embedding(4)',
+            context_features='three causal position offsets with validity, own object centroid and size, same/other object neighbor offsets and velocities, nearby foreign object centroid',
             correction='original position correction / dt, bounded particle velocity residual, mass-weighted P2G, no momentum projection',
             boundary='actual axis-aligned source planes sampled at simulation dx',
             predictor='MPM supplies the physics; compute_correction bypasses WorldParticle gravity/integration',
@@ -248,7 +251,39 @@ class WorldParticlePhysCoreCorrector(nn.Module):
             self._boundary_cache[key] = (torch.cat(points), torch.cat(normals))
         return self._boundary_cache[key]
 
-    def forward(self, x, v, F, C, log_E, nu, grid_m, physics, material_id):
+    def particle_context(self, positions, velocities, object_id, history):
+        extractor = self.backbone.local_feature_extractor
+        radius = float(extractor.filter_extent) / 2
+        n = len(positions)
+        counts = torch.bincount(object_id)
+        centers = positions.new_zeros((len(counts), 3)).index_add(0, object_id, positions)
+        centers = centers / counts.clamp_min(1)[:, None]
+        spatial = [(centers[object_id] - positions) / radius, counts[object_id, None].log1p()]
+        neighbors = extractor.particle_radius_search(
+            inp_positions=positions.detach(), out_positions=positions.detach(),
+            extents=extractor.filter_extent_tensor)
+        dst = torch.arange(n, device=positions.device).repeat_interleave(
+            neighbors['neighbors_row_splits'].diff(), output_size=neighbors['neighbors_index'].numel())
+        src = neighbors['neighbors_index'].long()
+        same = object_id[src] == object_id[dst]
+        for mask in (same & (src != dst), ~same):
+            i, j = dst[mask], src[mask]
+            count = torch.bincount(i, minlength=n)[:, None]
+            pair = torch.cat(((positions[j] - positions[i]) / radius, velocities[j] - velocities[i]), dim=1)
+            spatial.extend((positions.new_zeros((n, 6)).index_add(0, i, pair) / count.clamp_min(1), count.log1p()))
+        # ponytail: weight foreign-object centroids by nearby particle count;
+        # use unique (particle, object) pairs if equal object weighting is needed.
+        i, j = dst[~same], src[~same]
+        foreign_offset = (centers[object_id[j]] - positions[i]) / radius
+        spatial.append(positions.new_zeros((n, 3)).index_add(0, i, foreign_offset)
+                       / torch.bincount(i, minlength=n).clamp_min(1)[:, None])
+        offsets = (history[:, 0] - positions) / radius
+        temporal = positions.new_zeros((self.history_frames, n, 4))
+        temporal[:len(history), :, :3] = offsets
+        temporal[:len(history), :, 3] = 1
+        return torch.cat((*spatial, temporal.transpose(0, 1).flatten(1)), dim=1)
+
+    def forward(self, x, v, F, C, log_E, nu, grid_m, physics, material_id, object_id, history):
         # ponytail: one scene per call, batches use gradient accumulation; original batch_info supports future batched calls.
         if x.ndim != 3 or x.shape[0] != 1 or x.shape[1] < 2**self.merge_iterations:
             raise ValueError('This adapter requires one complete scene per call and enough particles for merging')
@@ -266,6 +301,7 @@ class WorldParticlePhysCoreCorrector(nn.Module):
             (log_E[0]-math.log(2000.))[:, None], nu[0, :, None],
             positions.new_full((n, 1), math.log(physics['density']/1000.)),
             params.expand(n, -1), self.material_embedding(material_id)), dim=1)
+        features = features + self.context_projection(self.particle_context(positions, velocities, object_id, history))
         boundary, normals = self._boundaries(physics, positions)
         delta_x, _ = self.backbone.compute_correction(positions, velocities, features, boundary, normals, k_partite=2)
         particle_dv = self.max_delta_v * torch.tanh(delta_x / (dt*self.max_delta_v))
