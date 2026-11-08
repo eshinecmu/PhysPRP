@@ -745,8 +745,9 @@ def train_material_step(model, engine, optimizer, batch,
 def physcore_gt_step(engine, episode, index, material, device):
     """One independent observed-state pair; never accept a prior predicted state."""
     state = physcore_state(episode, index, device)
-    if engine.particle_history_frames:
-        first = max(0, index - engine.particle_history_frames)
+    history_frames = getattr(engine, "particle_history_frames", 0)
+    if history_frames:
+        first = max(0, index - history_frames)
         state["particle_history"] = episode["particle_coords"][first:index].flip(0).unsqueeze(1).to(device)
     return physcore_advance(engine, state, material, 1)
 
